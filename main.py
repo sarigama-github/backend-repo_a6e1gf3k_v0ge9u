@@ -60,7 +60,7 @@ def verify_token(token: str) -> Dict[str, Any]:
         if not hmac.compare_digest(sig, expected):
             raise ValueError("Bad signature")
         payload_str = base64.urlsafe_b64decode(data.encode()).decode()
-        # eval-like safe parsing; payload is dict string. We'll parse simply.
+        # naive parse of dict-like string
         payload = {}
         for item in payload_str.strip("{} ").split(","):
             if not item.strip():
@@ -68,7 +68,7 @@ def verify_token(token: str) -> Dict[str, Any]:
             k, v = item.split(":", 1)
             payload[k.strip().strip("'\"")] = v.strip().strip("'\"")
         return payload
-    except Exception as e:
+    except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
@@ -170,12 +170,27 @@ def create_post(data: PostCreate, user: AuthedUser = Depends(get_current_user)):
     db["post"].insert_one(post)
     return post
 
+@app.get("/posts/{post_id}")
+def get_post(post_id: str, viewer: Optional[AuthedUser] = Depends(get_current_user)):
+    p = db["post"].find_one({"_id": post_id})
+    if not p:
+        raise HTTPException(404, "Post not found")
+    u = db["user"].find_one({"_id": p["user_id"]}, {"username": 1, "avatar_url": 1})
+    p["user"] = {
+        "username": u.get("username") if u else "unknown",
+        "avatar_url": (u or {}).get("avatar_url", "")
+    }
+    p["likes"] = db["like"].count_documents({"post_id": p["_id"]})
+    p["comments_count"] = db["comment"].count_documents({"post_id": p["_id"]})
+    if viewer:
+        p["viewer_liked"] = db["like"].find_one({"post_id": p["_id"], "user_id": viewer.id}) is not None
+    return p
+
 @app.get("/feed")
 def get_feed(limit: int = 10, cursor: Optional[str] = None):
     query: Dict[str, Any] = {}
     sort = [("created_at", -1), ("_id", -1)]
     if cursor:
-        # cursor is created_at|_id concatenated; for simplicity, use _id only
         query["_id"] = {"$lt": cursor}
     items = list(db["post"].find(query).sort(sort).limit(min(limit, 50)))
     for p in items:
@@ -283,6 +298,20 @@ def create_trip(data: TripCreate, user: AuthedUser = Depends(get_current_user)):
     }
     db["trip"].insert_one(trip)
     return trip
+
+@app.get("/trips")
+def list_trips(limit: int = 12, cursor: Optional[str] = None):
+    query: Dict[str, Any] = {}
+    sort = [("created_at", -1), ("_id", -1)]
+    if cursor:
+        query["_id"] = {"$lt": cursor}
+    items = list(db["trip"].find(query).sort(sort).limit(min(limit, 50)))
+    for t in items:
+        host = db["user"].find_one({"_id": t["host_id"]}, {"username": 1, "avatar_url": 1})
+        t["host"] = {"username": host.get("username") if host else "unknown", "avatar_url": (host or {}).get("avatar_url", "")}
+        t["joined_count"] = db["tripjoin"].count_documents({"trip_id": t["_id"], "status": "joined"})
+    next_cursor = items[-1]["_id"] if items else None
+    return {"items": items, "nextCursor": next_cursor}
 
 @app.get("/trips/{trip_id}")
 def get_trip(trip_id: str, viewer: Optional[AuthedUser] = Depends(get_current_user)):
